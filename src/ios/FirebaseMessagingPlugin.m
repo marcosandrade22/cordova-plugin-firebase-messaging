@@ -20,7 +20,13 @@
 @implementation FirebaseMessagingPlugin
 
 - (void)pluginInitialize {
+    NSLog(@"Starting Firebase Messaging plugin");
+
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(finishLaunching:) name:UIApplicationDidFinishLaunchingNotification object:nil];
+
+    if(![FIRApp defaultApp]) {
+        [FIRApp configure];
+    }
 }
 
 - (void)finishLaunching:(NSNotification *)notification {
@@ -72,6 +78,18 @@
     [[UIApplication sharedApplication] registerForRemoteNotifications];
 }
 
+- (void)revokeToken:(CDVInvokedUrlCommand *)command {
+    [[FIRInstanceID instanceID] deleteIDWithHandler:^(NSError *  _Nullable error) {
+        CDVPluginResult *pluginResult;
+        if (error) {
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:error.localizedDescription];
+        } else {
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+        }
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+    }];
+}
+
 - (void)getToken:(CDVInvokedUrlCommand *)command {
     NSString *fcmToken = [FIRMessaging messaging].FCMToken;
     if (fcmToken) {
@@ -108,7 +126,7 @@
 }
 
 - (void)subscribe:(CDVInvokedUrlCommand *)command {
-    NSString* topic = [NSString stringWithFormat:@"/topics/%@", [command.arguments objectAtIndex:0]];
+    NSString* topic = [NSString stringWithFormat:@"%@", [command.arguments objectAtIndex:0]];
 
     [[FIRMessaging messaging] subscribeToTopic:topic
                                     completion:^(NSError * _Nullable error) {
@@ -123,7 +141,7 @@
 }
 
 - (void)unsubscribe:(CDVInvokedUrlCommand *)command {
-    NSString* topic = [NSString stringWithFormat:@"/topics/%@", [command.arguments objectAtIndex:0]];
+    NSString* topic = [NSString stringWithFormat:@"%@", [command.arguments objectAtIndex:0]];
 
     [[FIRMessaging messaging] unsubscribeFromTopic:topic
                                         completion:^(NSError * _Nullable error) {

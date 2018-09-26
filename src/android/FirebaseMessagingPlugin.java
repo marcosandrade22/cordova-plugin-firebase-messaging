@@ -10,9 +10,12 @@ import android.support.v4.app.NotificationManagerCompat;
 import by.chemerisuk.cordova.support.CordovaMethod;
 import by.chemerisuk.cordova.support.ReflectiveCordovaPlugin;
 
+import com.google.android.gms.tasks.OnCompleteListener;
+import com.google.android.gms.tasks.Task;
 import com.google.firebase.messaging.FirebaseMessaging;
 import com.google.firebase.messaging.RemoteMessage;
 import com.google.firebase.iid.FirebaseInstanceId;
+import com.google.firebase.iid.InstanceIdResult;
 
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CallbackContext;
@@ -22,6 +25,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.util.Set;
 import me.leolin.shortcutbadger.ShortcutBadger;
 
@@ -29,65 +33,79 @@ import me.leolin.shortcutbadger.ShortcutBadger;
 public class FirebaseMessagingPlugin extends ReflectiveCordovaPlugin {
     private static final String TAG = "FirebaseMessagingPlugin";
 
-    private CallbackContext instanceIdCallback;
+    private JSONObject lastBundle;
+    private boolean isBackground = false;
+    private CallbackContext tokenRefreshCallback;
     private CallbackContext foregroundCallback;
     private CallbackContext backgroundCallback;
-    private static JSONObject lastBundle;
     private static FirebaseMessagingPlugin instance;
 
     @Override
     protected void pluginInitialize() {
         FirebaseMessagingPlugin.instance = this;
 
+        lastBundle = getNotificationData(cordova.getActivity().getIntent());
+
         Context context = cordova.getActivity().getApplicationContext();
-        Bundle bundle = cordova.getActivity().getIntent().getExtras();
-        try {
-            lastBundle = getNotificationData(bundle);
-        } catch (JSONException e) {
-            Log.e(TAG, "pluginInitialize", e);
-        }
         // cleanup badge value initially
         ShortcutBadger.applyCount(context, 0);
     }
 
-    @Override
-    public void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-
-        try {
-            JSONObject notificationData = getNotificationData(intent.getExtras());
-            if (notificationData != null) {
-                sendNotification(notificationData, true);
-            }
-        } catch (JSONException e) {
-            Log.e(TAG, "onNewIntent", e);
-        }
+    @CordovaMethod
+    private void subscribe(String topic, final CallbackContext callbackContext) {
+        FirebaseMessaging.getInstance().subscribeToTopic(topic)
+            .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<Void>() {
+                @Override
+                public void onComplete(Task<Void> task) {
+                    if (task.isSuccessful()) {
+                        callbackContext.success();
+                    } else {
+                        callbackContext.error(task.getException().getMessage());
+                    }
+                }
+            });
     }
 
     @CordovaMethod
-    private void subscribe(String topic, CallbackContext callbackContext) {
-        FirebaseMessaging.getInstance().subscribeToTopic(topic);
+    private void unsubscribe(String topic, final CallbackContext callbackContext) {
+        FirebaseMessaging.getInstance().unsubscribeFromTopic(topic)
+            .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<Void>() {
+                @Override
+                public void onComplete(Task<Void> task) {
+                    if (task.isSuccessful()) {
+                        callbackContext.success();
+                    } else {
+                        callbackContext.error(task.getException().getMessage());
+                    }
+                }
+            });
+    }
+
+    @CordovaMethod
+    private void revokeToken(CallbackContext callbackContext) throws IOException {
+        FirebaseInstanceId.getInstance().deleteInstanceId();
 
         callbackContext.success();
     }
 
     @CordovaMethod
-    private void unsubscribe(String topic, CallbackContext callbackContext) {
-        FirebaseMessaging.getInstance().unsubscribeFromTopic(topic);
-
-        callbackContext.success();
-    }
-
-    @CordovaMethod
-    private void getToken(CallbackContext callbackContext) {
-        String token = FirebaseInstanceId.getInstance().getToken();
-
-        callbackContext.success(token);
+    private void getToken(final CallbackContext callbackContext) {
+        FirebaseInstanceId.getInstance().getInstanceId()
+            .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<InstanceIdResult>() {
+                @Override
+                public void onComplete(Task<InstanceIdResult> task) {
+                    if (task.isSuccessful()) {
+                        callbackContext.success(task.getResult().getToken());
+                    } else {
+                        callbackContext.error(task.getException().getMessage());
+                    }
+                }
+            });
     }
 
     @CordovaMethod
     private void onTokenRefresh(CallbackContext callbackContext) {
-        instance.instanceIdCallback = callbackContext;
+        instance.tokenRefreshCallback = callbackContext;
     }
 
     @CordovaMethod
@@ -100,7 +118,7 @@ public class FirebaseMessagingPlugin extends ReflectiveCordovaPlugin {
         instance.backgroundCallback = callbackContext;
 
         if (lastBundle != null) {
-            sendNotification(lastBundle, true);
+            sendNotification(lastBundle, callbackContext);
             lastBundle = null;
         }
     }
@@ -121,8 +139,7 @@ public class FirebaseMessagingPlugin extends ReflectiveCordovaPlugin {
     private void getBadge(CallbackContext callbackContext) {
         Context context = cordova.getActivity();
         SharedPreferences settings = context.getSharedPreferences("badge", Context.MODE_PRIVATE);
-        int number = settings.getInt("badge", 0);
-        callbackContext.success(number);
+        callbackContext.success(settings.getInt("badge", 0));
     }
 
     @CordovaMethod
@@ -135,26 +152,74 @@ public class FirebaseMessagingPlugin extends ReflectiveCordovaPlugin {
         }
     }
 
-    public static void sendNotification(JSONObject notificationData, boolean background) {
+    @Override
+    public void onNewIntent(Intent intent) {
+        JSONObject notificationData = getNotificationData(intent);
+        if (instance != null && notificationData != null) {
+            sendNotification(notificationData, instance.backgroundCallback);
+        }
+    }
+
+    @Override
+    public void onPause(boolean multitasking) {
+        this.isBackground = true;
+    }
+
+    @Override
+    public void onResume(boolean multitasking) {
+        this.isBackground = false;
+    }
+
+    static void sendNotification(RemoteMessage remoteMessage) {
+        JSONObject notificationData = new JSONObject(remoteMessage.getData());
+        RemoteMessage.Notification notification = remoteMessage.getNotification();
+        try {
+            if (notification != null) {
+                JSONObject jsonNotification = new JSONObject();
+                jsonNotification.put("body", notification.getBody());
+                jsonNotification.put("title", notification.getTitle());
+                jsonNotification.put("sound", notification.getSound());
+                jsonNotification.put("icon", notification.getIcon());
+                jsonNotification.put("tag", notification.getTag());
+                jsonNotification.put("color", notification.getColor());
+                jsonNotification.put("clickAction", notification.getClickAction());
+
+                notificationData.put("gcm", jsonNotification);
+            }
+            notificationData.put("google.message_id", remoteMessage.getMessageId());
+            notificationData.put("google.sent_time", remoteMessage.getSentTime());
+
+            if (instance != null) {
+                CallbackContext callbackContext = instance.isBackground ?
+                    instance.backgroundCallback : instance.foregroundCallback;
+                instance.sendNotification(notificationData, callbackContext);
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "sendNotification", e);
+        }
+    }
+
+    static void sendInstanceId(String instanceId) {
         if (instance != null) {
-            CallbackContext callback = background ? instance.backgroundCallback : instance.foregroundCallback;
-            if (callback != null) {
-                PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, notificationData);
+            if (instance.tokenRefreshCallback != null && instanceId != null) {
+                PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, instanceId);
                 pluginResult.setKeepCallback(true);
-                callback.sendPluginResult(pluginResult);
+                instance.tokenRefreshCallback.sendPluginResult(pluginResult);
             }
         }
     }
 
-    public static void sendInstanceId(String instanceId) {
-        if (instance != null && instance.instanceIdCallback != null && instanceId != null) {
-            PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, instanceId);
+    private void sendNotification(JSONObject notificationData, CallbackContext callbackContext) {
+        if (callbackContext != null) {
+            PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, notificationData);
             pluginResult.setKeepCallback(true);
-            instance.instanceIdCallback.sendPluginResult(pluginResult);
+            callbackContext.sendPluginResult(pluginResult);
         }
     }
 
-    private static JSONObject getNotificationData(Bundle bundle) throws JSONException {
+    private JSONObject getNotificationData(Intent intent) {
+        Bundle bundle = intent.getExtras();
+
         if (bundle == null) {
             return null;
         }
@@ -163,11 +228,16 @@ public class FirebaseMessagingPlugin extends ReflectiveCordovaPlugin {
             return null;
         }
 
-        JSONObject notificationData = new JSONObject();
-        Set<String> keys = bundle.keySet();
-        for (String key : keys) {
-            notificationData.put(key, bundle.get(key));
+        try {
+            JSONObject notificationData = new JSONObject();
+            Set<String> keys = bundle.keySet();
+            for (String key : keys) {
+                notificationData.put(key, bundle.get(key));
+            }
+            return notificationData;
+        } catch (JSONException e) {
+            Log.e(TAG, "getNotificationData", e);
+            return null;
         }
-        return notificationData;
     }
 }
